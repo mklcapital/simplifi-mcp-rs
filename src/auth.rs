@@ -367,6 +367,38 @@ fn parse_iso_to_unix(s: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 
+/// Parse a web-app session export — the value of `localStorage["authSession"]`
+/// from a signed-in browser — into a [`TokenSet`], so a user who cannot hand
+/// their password to the CLI can seed the token cache from their existing
+/// browser session instead (the TS client's `auth import` path). Accepts the
+/// bare session object, the object wrapped as `{ "authSession": ... }`, or
+/// either as a JSON string. The session object uses the same key styles as a
+/// token payload, so parsing delegates to [`parse_token_payload`]. Token
+/// values are never logged or echoed by callers — only redacted status.
+pub fn parse_auth_session_export(text: &str) -> Result<TokenSet> {
+    let mut v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| Error::InvalidResponse("authSession export is not valid JSON"))?;
+    // The localStorage value is itself a JSON string.
+    if let Some(s) = v.as_str() {
+        v = serde_json::from_str(s)
+            .map_err(|_| Error::InvalidResponse("authSession export is not valid JSON"))?;
+    }
+    if let Some(inner) = v.get("authSession") {
+        v = match inner {
+            serde_json::Value::String(s) => serde_json::from_str(s).map_err(|_| {
+                Error::InvalidResponse("authSession export is not valid JSON")
+            })?,
+            other => other.clone(),
+        };
+    }
+    if !v.is_object() {
+        return Err(Error::InvalidResponse(
+            "authSession export is not a session object",
+        ));
+    }
+    parse_token_payload(&v)
+}
+
 /// Build an SA-11-safe API error: status + short upstream `error` code only, never the body.
 pub fn api_error(status: u16, resp: &ApiResponse) -> Error {
     let code = resp
@@ -505,5 +537,53 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ---- parse_auth_session_export: web-app session import ----
+
+    const SESSION_JSON: &str = r#"{
+        "accessToken": "acc-123",
+        "refreshToken": "ref-456",
+        "accessTokenExpired": "2099-01-01T00:00:00Z",
+        "refreshTokenExpired": "2099-06-01T00:00:00Z"
+    }"#;
+
+    #[test]
+    fn auth_session_export_parses_all_wrappings() {
+        // bare object
+        let ts = parse_auth_session_export(SESSION_JSON).unwrap();
+        assert_eq!(ts.access_token, "acc-123");
+        assert_eq!(ts.refresh_token, "ref-456");
+        assert!(ts.access_expires_at_unix > now_unix());
+        assert!(ts.refresh_expires_at_unix.is_some());
+        // { "authSession": {...} }
+        let wrapped = format!(r#"{{ "authSession": {SESSION_JSON} }}"#);
+        assert_eq!(
+            parse_auth_session_export(&wrapped).unwrap().access_token,
+            "acc-123"
+        );
+        // the localStorage value itself is a JSON string
+        let as_string = serde_json::to_string(SESSION_JSON).unwrap();
+        assert_eq!(
+            parse_auth_session_export(&as_string).unwrap().refresh_token,
+            "ref-456"
+        );
+        // { "authSession": "<json string>" }
+        let wrapped_string = serde_json::json!({ "authSession": SESSION_JSON }).to_string();
+        assert_eq!(
+            parse_auth_session_export(&wrapped_string)
+                .unwrap()
+                .access_token,
+            "acc-123"
+        );
+    }
+
+    #[test]
+    fn auth_session_export_rejects_garbage() {
+        assert!(parse_auth_session_export("not json").is_err());
+        assert!(parse_auth_session_export("[1,2]").is_err());
+        assert!(parse_auth_session_export("{}").is_err());
+        // missing refresh token -> parse_token_payload's requirement applies
+        assert!(parse_auth_session_export(r#"{ "accessToken": "x" }"#).is_err());
     }
 }

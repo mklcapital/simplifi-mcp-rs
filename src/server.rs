@@ -141,6 +141,56 @@ pub struct CategorizeTransactionInput {
     pub category_id: String,
 }
 
+/// One line of a split: a category and a signed amount (decimal string). Line
+/// amounts must total the transaction amount exactly.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SplitLineInput {
+    #[schemars(length(min = 1))]
+    pub category_id: String,
+    /// Signed decimal string, e.g. "-34.23".
+    #[schemars(length(min = 1))]
+    pub amount: String,
+    pub memo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SplitTransactionInput {
+    #[schemars(length(min = 1))]
+    pub transaction_id: String,
+    /// At least two lines; amounts must total the transaction amount exactly.
+    #[schemars(length(min = 2))]
+    pub lines: Vec<SplitLineInput>,
+}
+
+/// Bulk-apply one typed patch to every transaction matching the filters (the
+/// read-lane filter set plus an optional text query). With `confirm` false
+/// (default) this is a dry run: it reports how many transactions match and
+/// changes nothing.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BulkUpdateTransactionsInput {
+    /// Case-insensitive substring over payee / renamedPayee / memo /
+    /// mlInferredPayee.
+    pub query: Option<String>,
+    pub account_id: Option<String>,
+    /// ISO date YYYY-MM-DD.
+    pub date_from: Option<String>,
+    /// ISO date YYYY-MM-DD.
+    pub date_to: Option<String>,
+    /// Decimal string.
+    pub min_amount: Option<String>,
+    /// Decimal string.
+    pub max_amount: Option<String>,
+    pub include_deleted: Option<bool>,
+    /// Sync with Simplifi before matching. Default false.
+    pub refresh: Option<bool>,
+    pub patch: TransactionPatchInput,
+    /// False (default) = preview only. True = apply the patch to every match.
+    pub confirm: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchMerchantsInput {
@@ -376,6 +426,21 @@ fn txn_out(t: &Transaction) -> serde_json::Value {
     if let (Some(amount), Some(obj)) = (t.amount, v.as_object_mut()) {
         obj.insert("amount".to_string(), json!(amount.to_string()));
     }
+    // Parsed split lines alongside the raw `split` object, amounts as decimal
+    // strings like the parent amount.
+    if let (Some(lines), Some(obj)) = (t.split_lines(), v.as_object_mut()) {
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| {
+                json!({
+                    "categoryId": l.coa.as_ref().and_then(|c| c.id.clone()),
+                    "amount": l.amount.map(|a| a.to_string()),
+                    "memo": l.memo,
+                })
+            })
+            .collect();
+        obj.insert("splits".to_string(), json!(parsed));
+    }
     v
 }
 
@@ -423,6 +488,7 @@ fn err_code(e: &Error) -> &'static str {
         Error::LoginQuarantined { .. } | Error::RefreshBackoff { .. } => "rate_limited",
         Error::UnverifiedEndpointDisabled(_) => "unverified_endpoint_disabled",
         Error::MissingFields(_) => "missing_fields",
+        Error::InvalidArgument(_) => "invalid_argument",
         Error::Api { .. } => "simplifi_api_error",
         _ => "simplifi_error",
     }
@@ -1048,6 +1114,209 @@ impl SimplifiMcpServer {
                 upstream_err(e)
             }
         }
+    }
+
+    #[tool(
+        description = "Split a transaction across two or more categories. Line amounts \
+                       (decimal strings, signed like the transaction) must total the \
+                       transaction amount exactly. Requires SIMPLIFI_MCP_ALLOW_WRITES=1."
+    )]
+    pub async fn split_transaction(
+        &self,
+        Parameters(input): Parameters<SplitTransactionInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(msg) = self.write_gate() {
+            return err_json("writes_disabled", msg);
+        }
+        let mut lines = Vec::with_capacity(input.lines.len());
+        for l in &input.lines {
+            let amount = match parse_decimal(&l.amount) {
+                Ok(a) => a,
+                Err(e) => return err_json("invalid_argument", e),
+            };
+            lines.push(crate::models::SplitLine::new(
+                l.category_id.clone(),
+                amount,
+                l.memo.clone(),
+            ));
+        }
+        let base = match self.fetch_txn(&input.transaction_id, true).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return err_json(
+                    "not_found",
+                    format!("transaction {:?} not found", input.transaction_id),
+                )
+            }
+            Err(e) => return upstream_err(e),
+        };
+        if let Err(msg) = crate::models::validate_split(&base, &lines) {
+            return err_json("invalid_argument", msg);
+        }
+        if let Err(msg) = self.write_quota(1) {
+            return err_json("write_quota_exceeded", msg);
+        }
+        let audit = match self.audit() {
+            Ok(a) => a,
+            Err(msg) => return err_json("writes_disabled", msg),
+        };
+        let op = match audit.begin(
+            "split_transaction",
+            Some(&input.transaction_id),
+            json!({ "lines": serde_json::to_value(&lines).unwrap_or_default() }),
+            serde_json::to_value(&base).ok(),
+        ) {
+            Ok(op) => op,
+            Err(e) => return err_json("audit_unavailable", e),
+        };
+        match self.store.client().split_transaction(&base, &lines).await {
+            Ok((updated, ack)) => {
+                audit.finish(
+                    &op,
+                    "split_transaction",
+                    "ok",
+                    serde_json::to_value(&updated).ok(),
+                    serde_json::to_value(&ack).ok(),
+                );
+                self.store.upsert_local(updated.clone()).await;
+                ok_json(json!({ "mutation": ack, "transaction": txn_out(&updated) }))
+            }
+            Err(e) => {
+                audit.finish(
+                    &op,
+                    "split_transaction",
+                    &format!("error:{}", err_code(&e)),
+                    None,
+                    None,
+                );
+                upstream_err(e)
+            }
+        }
+    }
+
+    #[tool(
+        description = "Apply the same typed patch (category, tags, review flags, memo, ...) \
+                       to every transaction matching the filters. Dry run by default: with \
+                       confirm:false it only reports the match count and a sample. With \
+                       confirm:true it applies sequentially and reports per-transaction \
+                       results. Requires SIMPLIFI_MCP_ALLOW_WRITES=1 when confirming."
+    )]
+    pub async fn bulk_update_transactions(
+        &self,
+        Parameters(input): Parameters<BulkUpdateTransactionsInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let patch = match build_patch(&input.patch) {
+            Ok(p) => p,
+            Err(e) => return err_json("invalid_argument", e),
+        };
+        if let Err(e) = self
+            .store
+            .ensure_transactions(input.refresh.unwrap_or(false))
+            .await
+        {
+            return upstream_err(e);
+        }
+        let q = match TxnQuery::build(
+            input.account_id.clone(),
+            input.date_from.clone(),
+            input.date_to.clone(),
+            input.min_amount.clone(),
+            input.max_amount.clone(),
+            input.include_deleted,
+        ) {
+            Ok(q) => q,
+            Err(e) => return err_json("invalid_argument", e),
+        };
+        let matched = self.filtered_snapshot(&q, input.query.as_deref()).await;
+        if !input.confirm.unwrap_or(false) {
+            let sample: Vec<serde_json::Value> = matched
+                .iter()
+                .take(10)
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "postedOn": t.posted_on,
+                        "payee": t.renamed_payee.clone().or_else(|| t.payee.clone()),
+                        "amount": t.amount.map(|a| a.to_string()),
+                    })
+                })
+                .collect();
+            return ok_json(json!({
+                "preview": true,
+                "wouldUpdate": matched.len(),
+                "sample": sample,
+                "note": "re-run with confirm:true to apply the patch to every match",
+            }));
+        }
+        if let Err(msg) = self.write_gate() {
+            return err_json("writes_disabled", msg);
+        }
+        if matched.is_empty() {
+            return err_json("invalid_argument", "no transactions match the filters");
+        }
+        if let Err(msg) = self.write_quota(matched.len()) {
+            return err_json("write_quota_exceeded", msg);
+        }
+        let audit = match self.audit() {
+            Ok(a) => a,
+            Err(msg) => return err_json("writes_disabled", msg),
+        };
+        let ids: Vec<&str> = matched.iter().map(|t| t.id.as_str()).collect();
+        let op = match audit.begin(
+            "bulk_update_transactions",
+            None,
+            json!({
+                "patch": serde_json::to_value(&patch).unwrap_or_default(),
+                "transactionIds": ids,
+            }),
+            None,
+        ) {
+            Ok(op) => op,
+            Err(e) => return err_json("audit_unavailable", e),
+        };
+        let outcome = self
+            .store
+            .client()
+            .patch_transactions_bulk(&matched, &patch)
+            .await;
+        let mut results: Vec<serde_json::Value> = Vec::with_capacity(outcome.results.len());
+        let mut updated_count = 0usize;
+        for (base, r) in matched.iter().zip(outcome.results.iter()) {
+            match r {
+                Ok((updated, _ack)) => {
+                    updated_count += 1;
+                    self.store.upsert_local(updated.clone()).await;
+                    results.push(json!({ "id": base.id, "status": "updated" }));
+                }
+                Err(e) => {
+                    results.push(json!({
+                        "id": base.id,
+                        "status": "error",
+                        "message": e.to_string(),
+                    }));
+                }
+            }
+        }
+        audit.finish(
+            &op,
+            "bulk_update_transactions",
+            "ok",
+            None,
+            Some(json!({
+                "updated": updated_count,
+                "attempted": outcome.results.len(),
+                "aborted": outcome.aborted,
+                "results": &results,
+            })),
+        );
+        ok_json(json!({
+            "preview": false,
+            "updated": updated_count,
+            "attempted": outcome.results.len(),
+            "matched": matched.len(),
+            "aborted": outcome.aborted,
+            "results": results,
+        }))
     }
 
     #[tool(

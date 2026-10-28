@@ -46,13 +46,13 @@ pub mod store;
 pub mod token_cache;
 pub mod transport;
 
-pub use auth::{AuthManager, LoginFlow};
-pub use client::{BulkCreateOutcome, ListTransactionsParams, SimplifiClient};
+pub use auth::{parse_auth_session_export, AuthManager, LoginFlow};
+pub use client::{BulkCreateOutcome, BulkPatchOutcome, ListTransactionsParams, SimplifiClient};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use models::{
-    Account, Category, CoaRef, Dataset, EarliestDateOn, MetaData, MfaChallenge, NewTransaction,
-    Page, Tag, Transaction, TransactionPatch, UpsertAck, UserProfile,
+    validate_split, Account, Category, CoaRef, Dataset, EarliestDateOn, MetaData, MfaChallenge,
+    NewTransaction, Page, SplitLine, Tag, Transaction, TransactionPatch, UpsertAck, UserProfile,
 };
 pub use secrets::{Credentials, KeySource};
 pub use server::SimplifiMcpServer;

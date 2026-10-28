@@ -8,11 +8,11 @@ use secrecy::SecretString;
 
 use simplifi_mcp::mock::MockTransport;
 use simplifi_mcp::server::{
-    BulkImportInput, CategorizeTransactionInput, CreateTransactionInput, ExportFormat,
-    ExportTransactionsInput, GetTransactionInput, ListReferenceInput, ListTransactionsInput,
-    RecurringDetectionInput, RefreshOnlyInput, SearchMerchantsInput, SearchReferenceInput,
-    SearchTransactionsInput, SuggestCategoriesInput, TransactionPatchInput,
-    UpdateTransactionInput,
+    BulkImportInput, BulkUpdateTransactionsInput, CategorizeTransactionInput,
+    CreateTransactionInput, ExportFormat, ExportTransactionsInput, GetTransactionInput,
+    ListReferenceInput, ListTransactionsInput, RecurringDetectionInput, RefreshOnlyInput,
+    SearchMerchantsInput, SearchReferenceInput, SearchTransactionsInput, SplitLineInput,
+    SplitTransactionInput, SuggestCategoriesInput, TransactionPatchInput, UpdateTransactionInput,
 };
 use simplifi_mcp::transport::Transport;
 use simplifi_mcp::{Config, Credentials, KeySource, LoginFlow, SimplifiClient, SimplifiMcpServer};
@@ -100,6 +100,8 @@ fn router_exposes_full_tool_inventory() {
         // feature additions
         "create_transaction",
         "bulk_import_transactions",
+        "split_transaction",
+        "bulk_update_transactions",
         "list_accounts",
         "account_balances",
         "list_datasets",
@@ -487,6 +489,154 @@ async fn update_and_categorize_roundtrip() {
         .unwrap();
     assert!(is_error(&r));
     assert_eq!(payload(&r)["error"], "invalid_argument");
+}
+
+fn split_lines(pairs: &[(&str, &str)]) -> Vec<SplitLineInput> {
+    pairs
+        .iter()
+        .map(|(c, a)| SplitLineInput {
+            category_id: c.to_string(),
+            amount: a.to_string(),
+            memo: None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn split_transaction_roundtrip_and_gates() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // read-only server: writes_disabled before anything else
+    let s = read_server(dir.path()).await;
+    let r = s
+        .split_transaction(Parameters(SplitTransactionInput {
+            transaction_id: "txn-1".to_string(),
+            lines: split_lines(&[("cat-7", "-10.00"), ("cat-9", "-2.34")]),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert_eq!(payload(&r)["error"], "writes_disabled");
+
+    // writes on (unverified off): splits are live-verified, so no extra gate
+    let s = server_with(dir.path(), true, false).await;
+    let r = s
+        .split_transaction(Parameters(SplitTransactionInput {
+            transaction_id: "txn-1".to_string(),
+            lines: split_lines(&[("cat-7", "-10.00"), ("cat-9", "-2.34")]),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{:?}", payload(&r));
+
+    // fully enabled
+    let s = write_server(dir.path()).await;
+    // lines that don't total the amount (-12.34) are rejected pre-flight
+    let r = s
+        .split_transaction(Parameters(SplitTransactionInput {
+            transaction_id: "txn-1".to_string(),
+            lines: split_lines(&[("cat-7", "-10.00"), ("cat-9", "-2.00")]),
+        }))
+        .await
+        .unwrap();
+    assert!(is_error(&r));
+    assert_eq!(payload(&r)["error"], "invalid_argument");
+
+    let r = s
+        .split_transaction(Parameters(SplitTransactionInput {
+            transaction_id: "txn-1".to_string(),
+            lines: split_lines(&[("cat-7", "-10.00"), ("cat-9", "-2.34")]),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{:?}", payload(&r));
+    let p = payload(&r);
+    assert_eq!(p["mutation"]["status"], "SUCCESS");
+    // parsed splits ride along in the output, amounts as strings (display
+    // scale follows the money module's f64 wire convention, so compare values)
+    let splits = p["transaction"]["splits"].as_array().unwrap();
+    assert_eq!(splits.len(), 2);
+    assert_eq!(splits[0]["categoryId"], "cat-7");
+    let amt = |v: &serde_json::Value| v.as_str().unwrap().parse::<f64>().unwrap();
+    assert_eq!(amt(&splits[0]["amount"]), -10.00);
+    assert_eq!(amt(&splits[1]["amount"]), -2.34);
+
+    // write-through: the mirror shows the split immediately
+    let p = payload(
+        &s.get_transaction(Parameters(GetTransactionInput {
+            transaction_id: "txn-1".to_string(),
+            refresh_on_miss: Some(false),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(p["transaction"]["splits"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn bulk_update_dry_run_then_confirm() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = write_server(dir.path()).await;
+
+    // dry run (default) matches without touching anything — works read-only too
+    let r = s
+        .bulk_update_transactions(Parameters(BulkUpdateTransactionsInput {
+            query: Some("starbucks".to_string()),
+            account_id: None,
+            date_from: None,
+            date_to: None,
+            min_amount: None,
+            max_amount: None,
+            include_deleted: None,
+            refresh: None,
+            patch: TransactionPatchInput {
+                is_reviewed: Some(true),
+                ..Default::default()
+            },
+            confirm: None,
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{:?}", payload(&r));
+    let p = payload(&r);
+    assert_eq!(p["preview"], true);
+    assert_eq!(p["wouldUpdate"], 1);
+    assert_eq!(p["sample"][0]["id"], "txn-1");
+
+    // confirm applies the patch to every match
+    let r = s
+        .bulk_update_transactions(Parameters(BulkUpdateTransactionsInput {
+            query: Some("starbucks".to_string()),
+            account_id: None,
+            date_from: None,
+            date_to: None,
+            min_amount: None,
+            max_amount: None,
+            include_deleted: None,
+            refresh: None,
+            patch: TransactionPatchInput {
+                is_reviewed: Some(true),
+                ..Default::default()
+            },
+            confirm: Some(true),
+        }))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{:?}", payload(&r));
+    let p = payload(&r);
+    assert_eq!(p["preview"], false);
+    assert_eq!(p["updated"], 1);
+    assert_eq!(p["results"][0]["status"], "updated");
+
+    let p = payload(
+        &s.get_transaction(Parameters(GetTransactionInput {
+            transaction_id: "txn-1".to_string(),
+            refresh_on_miss: Some(false),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(p["transaction"]["isReviewed"], true);
 }
 
 #[tokio::test]

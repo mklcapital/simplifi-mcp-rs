@@ -26,6 +26,14 @@ struct Cli {
 enum Command {
     /// Interactive credential login (prompts on stdin for an MFA code if challenged).
     Login,
+    /// Seed the token cache from a web-app session export (the value of
+    /// localStorage["authSession"] from a signed-in browser), for users who
+    /// cannot hand their password to the CLI. Delete the export file after.
+    ImportSession {
+        /// Path to the authSession export (JSON).
+        #[arg(long)]
+        from_auth_session: std::path::PathBuf,
+    },
     /// Clear cached Simplifi tokens.
     Logout,
     /// Show redacted token-cache status (never prints secrets).
@@ -59,6 +67,15 @@ enum Command {
     EarliestDateOn {
         #[arg(long)]
         account_id: Vec<String>,
+    },
+    /// Dump the raw `split` object of one transaction plus its parsed lines —
+    /// the inspection step for HAR-verifying the split write shape.
+    InspectSplit {
+        /// Transaction id.
+        transaction_id: String,
+        /// Bound the id scan to transactions on/after this date (YYYY-MM-DD).
+        #[arg(long)]
+        date_on_after: Option<String>,
     },
     /// Run the MCP server on stdio (for Claude Desktop / Claude Code / any MCP client).
     Serve,
@@ -133,6 +150,18 @@ async fn run() -> simplifi_mcp::Result<()> {
                 }
             }
         }
+        Command::ImportSession { from_auth_session } => {
+            let text = std::fs::read_to_string(&from_auth_session)?;
+            let tokens = simplifi_mcp::parse_auth_session_export(&text)?;
+            client.auth().cache().store_tokens(&tokens)?;
+            // Redacted confirmation only — never the token values.
+            print_json(&client.auth().cache().status())?;
+            eprintln!(
+                "session imported; tokens cached (encrypted). \
+                 Delete the export file now: {}",
+                from_auth_session.display()
+            );
+        }
         Command::Logout => {
             client.auth().logout()?;
             println!("cached tokens cleared");
@@ -184,6 +213,36 @@ async fn run() -> simplifi_mcp::Result<()> {
         Command::EarliestDateOn { account_id } => {
             let r = client.earliest_date_on(&account_id).await?;
             print_json(&r)?;
+        }
+        Command::InspectSplit {
+            transaction_id,
+            date_on_after,
+        } => {
+            let txn = client
+                .find_transaction(&transaction_id, date_on_after.as_deref())
+                .await?
+                .ok_or_else(|| {
+                    simplifi_mcp::Error::Config(format!(
+                        "transaction {transaction_id} not found"
+                    ))
+                })?;
+            let lines: Vec<serde_json::Value> = txn
+                .split_lines()
+                .unwrap_or_default()
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "categoryId": l.coa.as_ref().and_then(|c| c.id.clone()),
+                        "amount": l.amount.map(|a| a.to_string()),
+                        "memo": l.memo,
+                    })
+                })
+                .collect();
+            print_json(&serde_json::json!({
+                "id": txn.id,
+                "split": txn.split_raw().cloned().unwrap_or(serde_json::Value::Null),
+                "parsedLines": lines,
+            }))?;
         }
         Command::Serve => {
             use rmcp::ServiceExt;

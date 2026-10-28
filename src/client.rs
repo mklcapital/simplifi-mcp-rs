@@ -53,6 +53,13 @@ pub struct BulkCreateOutcome {
     pub aborted: bool,
 }
 
+/// Outcome of a bulk patch: per-item updated transactions (or errors) in input
+/// order; `aborted` set when the consecutive-failure threshold stopped the run.
+pub struct BulkPatchOutcome {
+    pub results: Vec<Result<(Transaction, UpsertAck)>>,
+    pub aborted: bool,
+}
+
 pub struct SimplifiClient {
     cfg: Arc<Config>,
     transport: Arc<Transport>,
@@ -217,8 +224,9 @@ impl SimplifiClient {
         Ok(txns.into_iter().find(|t| t.id == id))
     }
 
-    /// `PUT /transactions/{id}` — full-object upsert. Validates the required field set
-    /// (spec section 4.2) before sending.
+    /// `PUT /transactions/{id}` — full-object upsert. Validates the required
+    /// field set (see `UPSERT_REQUIRED_FIELDS` — the spec's list is trimmed
+    /// to the fields live transactions actually carry) before sending.
     pub async fn update_transaction(&self, txn: &Transaction) -> Result<UpsertAck> {
         txn.validate_upsert_required().map_err(Error::MissingFields)?;
         let url = self.endpoint(&["transactions", &txn.id], &[])?;
@@ -249,6 +257,124 @@ impl SimplifiClient {
             ..Default::default()
         };
         self.patch_transaction(base, &patch).await
+    }
+
+    /// Split a transaction across categories: validate the lines (see
+    /// [`crate::models::validate_split`]), set the `split` object on a clone of
+    /// `base`, and PUT it like any other update.
+    ///
+    /// The wire shape was observed from live split transactions and verified
+    /// end-to-end (fresh-split and re-split PUTs accepted, 2026-10-27):
+    /// `split = { "items": [ { amount, clientId, coa, id?, memo, position,
+    /// rate, type: "NORMAL", is* flags } ] }`, with no parent `coa` on the
+    /// transaction. Lines are normalized before the PUT: a re-split inherits
+    /// the existing line at the same position (keeping its server
+    /// `id`/`clientId` stable, as the web app does); fresh lines get a
+    /// generated clientId and the web app's defaults. `rate` always mirrors
+    /// `amount`; `position` is the line index.
+    pub async fn split_transaction(
+        &self,
+        base: &Transaction,
+        lines: &[crate::models::SplitLine],
+    ) -> Result<(Transaction, UpsertAck)> {
+        crate::models::validate_split(base, lines).map_err(Error::InvalidArgument)?;
+        let existing = base.split_lines().unwrap_or_default();
+        let wire: Vec<crate::models::SplitLine> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut w = existing.get(i).cloned().unwrap_or_else(|| {
+                    crate::models::SplitLine {
+                        coa: None,
+                        amount: None,
+                        memo: None,
+                        extra: crate::models::Extra::new(),
+                    }
+                });
+                w.coa = l.coa.clone();
+                w.amount = l.amount;
+                if l.memo.is_some() {
+                    w.memo = l.memo.clone();
+                }
+                if w.memo.is_none() {
+                    w.memo = Some(String::new());
+                }
+                if !w.extra.contains_key("clientId") {
+                    w.extra.insert(
+                        "clientId".to_string(),
+                        serde_json::Value::String(
+                            uuid::Uuid::new_v4().to_string().to_uppercase(),
+                        ),
+                    );
+                }
+                for flag in [
+                    "isBillable",
+                    "isExcludedFromF2S",
+                    "isExcludedFromReports",
+                    "isOverflow",
+                    "isRatePercentage",
+                    "isTaxable",
+                ] {
+                    if !w.extra.contains_key(flag) {
+                        w.extra
+                            .insert(flag.to_string(), serde_json::Value::Bool(false));
+                    }
+                }
+                if !w.extra.contains_key("type") {
+                    w.extra.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("NORMAL".to_string()),
+                    );
+                }
+                w.extra.insert(
+                    "position".to_string(),
+                    serde_json::Value::Number(i.into()),
+                );
+                if let Some(a) = l.amount {
+                    use rust_decimal::prelude::ToPrimitive;
+                    if let Some(f) = a.to_f64() {
+                        if let Some(n) = serde_json::Number::from_f64(f) {
+                            w.extra.insert("rate".to_string(), serde_json::Value::Number(n));
+                        }
+                    }
+                }
+                w
+            })
+            .collect();
+        let mut updated = base.clone();
+        updated.apply_split(&wire);
+        let ack = self.update_transaction(&updated).await?;
+        Ok((updated, ack))
+    }
+
+    /// Apply the same typed patch to many transactions, sequentially (paced by
+    /// the global request floor), aborting after `BULK_ABORT_AFTER` consecutive
+    /// failures so a systemic rejection can't turn into a hammer.
+    pub async fn patch_transactions_bulk(
+        &self,
+        bases: &[Transaction],
+        patch: &TransactionPatch,
+    ) -> BulkPatchOutcome {
+        let mut results = Vec::with_capacity(bases.len());
+        let mut consecutive_failures = 0usize;
+        let mut aborted = false;
+        for base in bases {
+            match self.patch_transaction(base, patch).await {
+                Ok(pair) => {
+                    consecutive_failures = 0;
+                    results.push(Ok(pair));
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    results.push(Err(e));
+                    if consecutive_failures >= BULK_ABORT_AFTER {
+                        aborted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        BulkPatchOutcome { results, aborted }
     }
 
     // ------------------------------------------------ transaction creation (UNVERIFIED)

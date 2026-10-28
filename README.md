@@ -110,7 +110,7 @@ Everything is a `SIMPLIFI_*` environment variable (defaults shown; see
 | `SIMPLIFI_MCP_HTTP_TOKEN` | — | Bearer token for `serve-http` (required, ≥ 32 chars) |
 | `SIMPLIFI_MCP_HTTP_ALLOW_NONLOCAL` | `false` | Permit non-loopback bind for `serve-http` |
 
-## MCP tools (19)
+## MCP tools (21)
 
 Read tools serve a freshness-gated in-memory mirror: the first call full-fetches
 transactions + reference data, later calls sync incrementally (`modifiedAfter`).
@@ -145,6 +145,8 @@ outputs are `{total, nextCursor?, items}`.
 | `list_datasets` | Datasets visible to the logged-in user |
 | `export_transactions` | `json`, `csv` (import-template), or `csv_full` (archival); oldest-first, 10k cap, formula-injection-sanitized |
 | `recurring_detection` | Normalized-payee cadence detection (weekly → annual) with next-expected dates |
+| `split_transaction` | Split a transaction across ≥ 2 categories; line amounts must total the transaction amount exactly (decimal-checked) — **write-gated**. Wire shape observed from live transactions and verified end-to-end (fresh-split and re-split PUTs, 2026-10-27): `split = {"items": [...]}`, no parent `coa`; re-splits preserve line ids. Setting a category directly on a split transaction clears its split, mirroring the web app |
+| `bulk_update_transactions` | Apply one typed patch to every transaction matching the read-lane filters (+ optional text query); `confirm:false` previews matches, `confirm:true` applies sequentially — **write-gated** |
 
 ### Write gating (defense in depth)
 
@@ -174,12 +176,14 @@ outputs are `{total, nextCursor?, items}`.
 
 ```sh
 simplifi-mcp login          # interactive credential login (prompts for MFA code)
+simplifi-mcp import-session --from-auth-session f.json  # seed token cache from a browser session export
 simplifi-mcp logout         # clear cached tokens
 simplifi-mcp status         # redacted cache status (never prints secrets)
 simplifi-mcp whoami         # GET /userprofiles/me sanity probe
 simplifi-mcp datasets|accounts|categories|tags
 simplifi-mcp transactions --all --date-on-after 2024-01-01
 simplifi-mcp earliest-date-on
+simplifi-mcp inspect-split <txn-id>   # raw split object + parsed lines (split-shape verification)
 simplifi-mcp serve          # MCP over stdio
 simplifi-mcp serve-http     # MCP over HTTP (feature `http`)
 ```
@@ -191,7 +195,7 @@ entire stack (auth flow, MFA challenge, pagination, tools) runs with **zero live
 credentials and zero network**:
 
 ```sh
-cargo test --features mock            # full suite: 77 tests, no network
+cargo test --features mock            # full suite: 85 tests, no network
 cargo test --features "mock http"     # + HTTP transport tests
 cargo clippy --all-targets --features "mock http" -- -D warnings
 cargo audit

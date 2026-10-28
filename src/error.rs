@@ -70,6 +70,11 @@ pub enum Error {
     /// Transaction failed upsert-required-fields validation (PORTING-SPEC section 4.2).
     #[error("transaction missing required upsert fields: {}", .0.join(", "))]
     MissingFields(Vec<&'static str>),
+
+    /// Caller supplied an invalid argument, detected before any network traffic
+    /// (e.g. split lines that do not total the transaction amount).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
